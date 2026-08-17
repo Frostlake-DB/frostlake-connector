@@ -1,0 +1,2 @@
+# The facade's tests ship in the sdist so it can be audited and verified from source.
+include test/test_facade.py

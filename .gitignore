@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+db-engine.log
+.idea
+.venv/
+
+# build artifacts
+frostlake_connector.egg-info/
+build/
+dist/
