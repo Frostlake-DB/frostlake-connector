@@ -38,7 +38,7 @@ from .errors import (  # noqa: F401  (re-exported for `except frostlake_connecto
     ProgrammingError,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 apilevel = "2.0"
 threadsafety = 2
 paramstyle = "pyformat"
@@ -168,14 +168,14 @@ class FrostlakeConnection(object):
 
     # -- internal ------------------------------------------------------------
 
-    def _run(self, sql, query_id=None):
+    def _run(self, sql, query_id=None, num_statements=None):
         while self._pending:
             pending = self._pending.pop(0)
             _guard(self._inner._execute, pending, query=pending)
         if self._begin_pending:
             self._begin_pending = False
             _guard(self._inner.begin)
-        return _guard(self._inner._execute, sql, query=sql, query_id=query_id)
+        return _guard(self._inner._execute, sql, num_statements, query=sql, query_id=query_id)
 
 
 class FrostlakeCursor(object):
@@ -193,7 +193,13 @@ class FrostlakeCursor(object):
 
     # -- execution -----------------------------------------------------------
 
-    def execute(self, command, params=None, **kwargs):
+    def execute(self, command, params=None, num_statements=None, **kwargs):
+        """Run one statement, or a pack of them.
+
+        `num_statements` is the account's own connector spelling: how many statements this
+        call carries, `0` for any number. It travels with the request, outranks the
+        session's MULTI_STATEMENT_COUNT for this call alone, and moves no session state.
+        """
         del kwargs  # timeout/_bind_stage/... accepted and ignored
         # Stamp the id before running, so a statement that fails is identifiable too.
         self.query_id = _uuid.uuid4().hex
@@ -204,7 +210,8 @@ class FrostlakeCursor(object):
                                  query=command, query_id=self.query_id)
             else:
                 command = _bind_pyformat(command, params)
-        out = self.connection._run(command, query_id=self.query_id)
+        out = self.connection._run(command, query_id=self.query_id,
+                                   num_statements=num_statements)
         self._load(out)
         return self
 
@@ -281,8 +288,10 @@ class FrostlakeCursor(object):
                 ResultMetadata(
                     name=d[0],
                     type_code=constants.type_code_for(d[1]),
-                    display_size=None,
-                    internal_size=None,
+                    # the driver reports the wire's length for text and binary
+                    # columns here, and None for every other type
+                    display_size=d[2],
+                    internal_size=d[3],
                     precision=d[4],
                     scale=d[5],
                     # d[6] is the server's nullability; only assume nullable when it

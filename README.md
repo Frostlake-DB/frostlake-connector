@@ -41,13 +41,24 @@ print(cur.fetchall())          # [(1, 'Ada')]
 - `connect(**kwargs)` — `host`/`port` select the server; `role`, `warehouse`, `database`
   and `schema` become `USE` statements (in that order) and `session_parameters`/`timezone`
   become `ALTER SESSION SET`. Unrecognised keywords are accepted and ignored, so a
-  configuration carried over from another warehouse still loads.
+  configuration carried over from another warehouse still loads. Those names fold like
+  unquoted SQL — `database="my_db"` selects `MY_DB` — so include the double quotes
+  (`database='"my_db"'`) to reach an object whose real name is not upper case.
 - **Cursors**: `execute` (returns the cursor), `executemany`, `fetchone`/`fetchmany`/
   `fetchall`, `nextset` for multi-statement results, iteration, context-manager use,
   `rowcount` from DML, and `query_id`. `DictCursor` returns dicts instead of tuples.
+  A script handed to `execute` whole travels as one request, and a session runs one statement
+  per request until something asks for more: `execute(sql, num_statements=n)` declares the
+  count for that one call (`0` for any number), as the account's connector does, and leaves the
+  session's own `MULTI_STATEMENT_COUNT` where it was, while
+  `ALTER SESSION SET MULTI_STATEMENT_COUNT = n` sets it for the session; `execute_string`
+  splits the script client-side instead, so it needs neither.
 - **Descriptions**: `ResultMetadata(name, type_code, display_size, internal_size,
   precision, scale, is_nullable)`, where `type_code` is a numeric family code — see
   `constants.FIELD_ID_TO_NAME` — so callers can branch without parsing SQL type text.
+  `internal_size` carries the column's length — characters for text, bytes for binary —
+  when the server sends one, and stays `None` for other types and for engines predating
+  the field. `display_size` is always `None`, as in the account's own Python client.
 - **Binding**: `pyformat` by default (`%s`, `%(name)s`, `%%`), or `paramstyle="qmark"`
   for `?`. Placeholders inside string literals, quoted identifiers, comments and
   `$$…$$` bodies are left alone.

@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-db-engine.log
+*.log
 .idea
 .venv/
 

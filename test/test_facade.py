@@ -5,11 +5,14 @@ integration tests skip themselves when the variable is unset.
 """
 
 import atexit
+import http.server
+import json
 import os
 import pathlib
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.error
@@ -373,6 +376,47 @@ class FacadeTest(unittest.TestCase):
         self.assertEqual([("FAC_ROLE",)], cur2.fetchall())
         conn2.close()
 
+    def test_a_quoted_database_kwarg_reaches_a_lower_case_object(self):
+        # The names in connect() fold like unquoted SQL, so a database whose real name
+        # is lower case is reachable only by passing the quotes along with it.
+        conn, cur = self.bootstrap("fac_quoting_db")
+        cur.execute('CREATE OR REPLACE DATABASE "fac_lower_db"')
+        conn.close()
+        conn2 = sc.connect(host="127.0.0.1", port=PORT, database='"fac_lower_db"')
+        cur2 = conn2.cursor()
+        cur2.execute("SELECT CURRENT_DATABASE() AS d")
+        # 0.1.0 keeps the quoted name's case; 0.0.7 upper-cased it on the way in and
+        # looked names up case-insensitively, so either answer means the USE landed.
+        self.assertIn(cur2.fetchall(), ([("fac_lower_db",)], [("FAC_LOWER_DB",)]))
+        conn2.close()
+
+    def test_semi_structured_values_come_back_as_their_json_text(self):
+        # The client inherits the driver's rule: a semi-structured cell is the JSON text
+        # of the value, and its type_code names the family it came from.
+        conn, cur = self.bootstrap("fac_variant_db")
+        cur.execute("CREATE OR REPLACE TABLE v (j VARIANT, o OBJECT, a ARRAY)")
+        cur.execute("""INSERT INTO v SELECT PARSE_JSON('{"a":1}'),
+                       OBJECT_CONSTRUCT('b', 2), ARRAY_CONSTRUCT(1, 2)""")
+        cur.execute("SELECT j, o, a FROM v")
+        self.assertEqual(["VARIANT", "OBJECT", "ARRAY"],
+                         [constants.FIELD_ID_TO_NAME[d.type_code] for d in cur.description])
+        self.assertEqual([('{"a":1}', '{"b":2}', "[1,2]")], cur.fetchall())
+        conn.close()
+
+    def test_description_reports_text_and_binary_lengths(self):
+        conn, cur = self.bootstrap("fac_len_db")
+        cur.execute("CREATE OR REPLACE TABLE s (t VARCHAR(20), b BINARY(10), n NUMBER(12,2))")
+        cur.execute("SELECT t, b, n FROM s")
+        sizes = [(d.display_size, d.internal_size) for d in cur.description]
+        if sizes[0][1] is None:
+            # An engine predating the wire's length field sends none at all.
+            self.assertEqual([(None, None)] * 3, sizes)
+        else:
+            # internal_size carries the length; display_size is None throughout, which is
+            # the shape the account's own Python client reports.
+            self.assertEqual([(None, 20), (None, 10), (None, None)], sizes)
+        conn.close()
+
     def test_cursor_fetch_mechanics(self):
         conn, cur = self.bootstrap("fac_fetch_db")
         cur.execute("SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4")
@@ -428,6 +472,10 @@ class FacadeTest(unittest.TestCase):
 
     def test_nextset_walks_a_multi_statement_execute(self):
         conn, cur = self.bootstrap("fac_nextset_db")
+        # A script handed to execute whole travels as one request, and a session
+        # runs one statement per request until it asks for more. (execute_string
+        # splits client-side, so it never needs this.)
+        cur.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0")
         cur.execute("SELECT 1 AS a; SELECT 2 AS b; SELECT 3 AS c;")
         collected = [cur.fetchall()]
         while cur.nextset():
@@ -505,14 +553,20 @@ class FacadeTest(unittest.TestCase):
         self.assertEqual([(4,)], cursors[1].fetchall())
         conn.close()
 
-    def test_dict_cursor_on_a_statement_with_no_result_set(self):
-        # DDL leaves description None; a DictCursor has no names to zip against and
-        # must hand back what it got rather than fall over.
+    def test_dict_cursor_on_a_ddl_statement(self):
+        # Engines before 0.1.0 answer DDL with no result set (description None, no
+        # rows); 0.1.0 answers with a one-row status grid, as live does. Either way a
+        # DictCursor hands back what it got rather than fall over.
         conn, _ = self.bootstrap("fac_dict_ddl_db")
         cur = conn.cursor(DictCursor)
         cur.execute("CREATE OR REPLACE TABLE t (a INTEGER)")
-        self.assertIsNone(cur.description)
-        self.assertEqual([], cur.fetchall())
+        rows = cur.fetchall()
+        if cur.description is None:
+            self.assertEqual([], rows)
+        else:
+            self.assertEqual(["status"], [column[0] for column in cur.description])
+            self.assertEqual(1, len(rows))
+            self.assertIn("status", rows[0])
         conn.close()
 
     def test_binding_errors_surface_as_programming_errors(self):
@@ -719,6 +773,102 @@ class FacadeTest(unittest.TestCase):
         cur.execute("SELECT COUNT(*) AS n FROM acc")
         self.assertEqual(cur.fetchall(), [(2,)])
         conn.close()
+
+
+class MultiStatementCountTest(unittest.TestCase):
+    """`cursor.execute(..., num_statements=N)`, the account's connector spelling."""
+
+    def setUp(self):
+        if PORT is None:
+            self.skipTest("FROSTLAKE_CLASSPATH not set")
+        self.conn = sc.connect(host="127.0.0.1", port=PORT)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_a_declared_pack_runs(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 AS a; SELECT 2 AS b;", num_statements=2)
+        self.assertEqual([(1,)], cur.fetchall())
+
+    def test_zero_takes_any_number(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 AS a; SELECT 2 AS b; SELECT 3 AS c;", num_statements=0)
+        self.assertEqual([(1,)], cur.fetchall())
+
+    def test_the_session_count_is_untouched(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 AS a; SELECT 2 AS b;", num_statements=2)
+        # The count travelled with that request; the session still refuses an undeclared pack.
+        enforced = True
+        try:
+            cur.execute("SELECT 1 AS a; SELECT 2 AS b;")
+        except errors.ProgrammingError:
+            pass
+        else:
+            enforced = False
+        # Either way the connection is still usable for an ordinary statement.
+        cur.execute("SELECT 9 AS a")
+        self.assertEqual([(9,)], cur.fetchall())
+        if not enforced:
+            # An engine predating the statement-count rule accepts any pack, so it has
+            # nothing to refuse here. Skip rather than pass: the refusal is the point.
+            self.skipTest("this engine does not enforce the statement count")
+
+    def test_a_bad_count_is_refused(self):
+        cur = self.conn.cursor()
+        self.assertRaises(errors.ProgrammingError,
+                          cur.execute, "SELECT 1", None, -1)
+
+
+class MultiStatementCountWireTest(unittest.TestCase):
+    """What `num_statements` puts on the wire — no server of the engine's needed."""
+
+    BODIES = []
+
+    @classmethod
+    def setUpClass(cls):
+        bodies = cls.BODIES
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                bodies.append(json.loads(self.rfile.read(length).decode("utf-8")))
+                body = b'{"success": true, "sessionId": "s1", "resultSets": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        del self.BODIES[:]
+        self.conn = sc.connect(host="127.0.0.1", port=self.server.server_address[1])
+
+    def test_asking_for_nothing_sends_no_field(self):
+        self.conn.cursor().execute("SELECT 1")
+        self.assertNotIn("multiStatementCount", self.BODIES[-1])
+
+    def test_a_count_rides_on_the_request(self):
+        self.conn.cursor().execute("SELECT 1; SELECT 2;", num_statements=2)
+        self.assertEqual(2, self.BODIES[-1]["multiStatementCount"])
+        self.assertEqual(["SELECT 1; SELECT 2;"], [b["sql"] for b in self.BODIES])
+
+    def test_zero_is_an_answer_and_is_sent(self):
+        self.conn.cursor().execute("SELECT 1; SELECT 2;", num_statements=0)
+        self.assertEqual(0, self.BODIES[-1]["multiStatementCount"])
 
 
 if __name__ == "__main__":
