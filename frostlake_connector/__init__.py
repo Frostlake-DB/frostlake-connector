@@ -41,7 +41,7 @@ from .errors import (  # noqa: F401  (re-exported for `except frostlake_connecto
     SessionLostError,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 apilevel = "2.0"
 threadsafety = 2
 paramstyle = "pyformat"
