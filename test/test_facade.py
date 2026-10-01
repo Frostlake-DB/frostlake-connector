@@ -6,6 +6,7 @@ integration tests skip themselves when the variable is unset.
 
 import atexit
 import http.server
+import importlib.util
 import json
 import os
 import pathlib
@@ -307,6 +308,14 @@ class GuardTranslationTest(unittest.TestCase):
                           sc._guard, self.raising(frostlake.OperationalError("down")))
         self.assertRaises(errors.InterfaceError,
                           sc._guard, self.raising(frostlake.InterfaceError("closed")))
+
+    def test_a_lost_session_keeps_a_class_of_its_own(self):
+        import frostlake
+        with self.assertRaises(errors.SessionLostError) as caught:
+            sc._guard(self.raising(frostlake.SessionLostError("gone")), query="SELECT 1")
+        self.assertIsInstance(caught.exception, errors.OperationalError)
+        self.assertEqual("frostlake_connector.errors", type(caught.exception).__module__)
+        self.assertEqual("SELECT 1", caught.exception.query)
 
     def test_any_other_driver_error_becomes_a_database_error(self):
         import frostlake
@@ -869,6 +878,627 @@ class MultiStatementCountWireTest(unittest.TestCase):
     def test_zero_is_an_answer_and_is_sent(self):
         self.conn.cursor().execute("SELECT 1; SELECT 2;", num_statements=0)
         self.assertEqual(0, self.BODIES[-1]["multiStatementCount"])
+
+
+# -- session lifetime ---------------------------------------------------------------
+
+class ScriptedEngine(object):
+    """A stand-in engine on a local socket: it answers each request from a script and
+    records what it was sent. A request the script did not expect is recorded as such and
+    answered with a body that is not an engine's."""
+
+    def __init__(self):
+        self.requests = []
+        self.unscripted = []
+        self._script = []
+        engine = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                engine._handle(self)
+
+            do_POST = do_GET
+            do_DELETE = do_GET
+
+            def log_message(self, fmt, *args):
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._server.block_on_close = False
+        threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        self.port = self._server.server_address[1]
+
+    def reply(self, body, status=200):
+        self._script.append((status, json.dumps(body)))
+
+    def reply_text(self, text, status):
+        """Answer with a body that is not JSON, the way a proxy in the way does."""
+        self._script.append((status, text))
+
+    def drop(self):
+        """Close the socket without answering."""
+        self._script.append((None, ""))
+
+    @property
+    def pending(self):
+        return len(self._script)
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+    def _handle(self, handler):
+        length = int(handler.headers.get("Content-Length") or 0)
+        raw = handler.rfile.read(length) if length else b""
+        body = json.loads(raw.decode("utf-8")) if raw else None
+        self.requests.append((handler.command, handler.path, body))
+        if self._script:
+            status, text = self._script.pop(0)
+        else:
+            self.unscripted.append((handler.command, handler.path, body))
+            status, text = 500, "<html>unscripted</html>"
+        if status is None:
+            handler.close_connection = True
+            return
+        payload = text.encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    def statements(self):
+        return [body["sql"] for _, path, body in self.requests if path == "/api/execute"]
+
+    def executes(self):
+        return [body for _, path, body in self.requests if path == "/api/execute"]
+
+
+def _status():
+    return {"columns": [{"name": "status", "dataType": "VARCHAR"}],
+            "rows": [["Statement executed successfully."]], "rowCount": 1, "updateCount": -1}
+
+
+def _number(name, value):
+    return {"columns": [{"name": name, "dataType": "NUMBER", "precision": 38, "scale": 0}],
+            "rows": [[value]], "rowCount": 1, "updateCount": -1}
+
+
+def _answer(session_id, started, *sets):
+    return {"success": True, "sessionId": session_id, "newSession": started,
+            "errorMessage": None, "resultSets": list(sets)}
+
+
+def _gone(session_id):
+    return {"success": False, "sessionId": None, "newSession": False,
+            "errorMessage": "Session '%s' does not exist or has expired." % session_id,
+            "resultSets": []}
+
+
+_RELEASED = {"success": True, "sessionId": None, "newSession": False, "resultSets": []}
+
+# What connect() below sets up, in the order the connection applies it.
+_SETUP = ["USE ROLE R1", "USE WAREHOUSE W1", "USE DATABASE APP", "USE SCHEMA PUBLIC",
+          "ALTER SESSION SET QUERY_TAG = 'tagged'"]
+
+
+class SessionLifetimeTest(unittest.TestCase):
+    """The connection's session over a scripted engine: no engine of the real kind needed."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def connect(self, **extra):
+        return sc.connect(host="127.0.0.1", port=self.engine.port, network_timeout=5,
+                          role="R1", warehouse="W1", database="APP", schema="PUBLIC",
+                          session_parameters={"QUERY_TAG": "tagged"}, **extra)
+
+    def set_up(self, session_id):
+        self.engine.reply(_answer(session_id, True, _status()))
+        for _ in _SETUP[1:]:
+            self.engine.reply(_answer(session_id, False, _status()))
+
+    def opened(self, **extra):
+        """A connection that has run SELECT 1 on session s1, after its setup."""
+        self.set_up("s1")
+        self.engine.reply(_answer("s1", False, _number("N", 1)))
+        conn = self.connect(**extra)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS N")
+        return conn, cur
+
+    def assert_all_answered(self):
+        self.assertEqual([], self.engine.unscripted)
+        self.assertEqual(0, self.engine.pending)
+
+    def assert_session_lost(self, call, *args):
+        # Caught as the PEP 249 class first, so a client that raises something else shows
+        # what it raised.
+        with self.assertRaises(errors.OperationalError) as caught:
+            call(*args)
+        self.assertIsInstance(caught.exception, errors.SessionLostError)
+        return caught.exception
+
+    def test_the_session_is_required_once_the_engine_has_said_it_can(self):
+        self.opened()
+        bodies = self.engine.executes()
+        self.assertNotIn("requireSession", bodies[0])
+        for body in bodies[1:]:
+            self.assertEqual("s1", body["sessionId"])
+            self.assertIs(True, body["requireSession"])
+        self.assertEqual(_SETUP + ["SELECT 1 AS N"], self.engine.statements())
+
+    def test_a_lost_session_comes_back_on_the_connect_setup_and_the_statement_is_resent(self):
+        conn, cur = self.opened()
+        self.engine.reply(_gone("s1"), status=404)
+        self.set_up("s2")
+        self.engine.reply(_answer("s2", False, _number("N", 2)))
+        cur.execute("SELECT 2 AS N")
+        self.assertEqual([(2,)], cur.fetchall())
+        # The setup is the connection's own, not the caller's context, so it is what the
+        # fresh session gets: the statement is not refused over it.
+        self.assertEqual(_SETUP + ["SELECT 1 AS N", "SELECT 2 AS N"] + _SETUP + ["SELECT 2 AS N"],
+                         self.engine.statements())
+        self.assertEqual("s2", conn.session_id)
+        self.assert_all_answered()
+
+    def test_a_lost_transaction_is_reported_and_the_next_statement_starts_over(self):
+        conn, cur = self.opened()
+        conn.autocommit(False)
+        self.engine.reply(_answer("s1", False, _status()))
+        self.engine.reply(_answer("s1", False, _number("number of rows inserted", 1)))
+        cur.execute("INSERT INTO t VALUES (1)")
+        self.engine.reply(_gone("s1"), status=404)
+        error = self.assert_session_lost(cur.execute, "INSERT INTO t VALUES (2)")
+        self.assertIn("transaction", error.msg)
+        self.assertEqual("INSERT INTO t VALUES (2)", error.query)
+        self.assertFalse(conn.is_closed())
+        # A fresh session on the setup, and with autocommit off, a transaction on it.
+        self.set_up("s2")
+        self.engine.reply(_answer("s2", False, _status()))
+        self.engine.reply(_answer("s2", False, _number("N", 3)))
+        cur.execute("SELECT 3 AS N")
+        self.assertEqual(_SETUP + ["BEGIN", "SELECT 3 AS N"], self.engine.statements()[9:])
+        self.assert_all_answered()
+
+    def test_a_lost_session_after_a_use_is_reported(self):
+        conn, cur = self.opened()
+        self.engine.reply(_answer("s1", False, _status()))
+        cur.execute("USE SCHEMA OTHER")
+        self.engine.reply(_gone("s1"), status=404)
+        error = self.assert_session_lost(cur.execute, "SELECT * FROM t")
+        self.assertIn("context", error.msg)
+        self.assertEqual(_SETUP + ["SELECT 1 AS N", "USE SCHEMA OTHER", "SELECT * FROM t"],
+                         self.engine.statements())
+        self.assert_all_answered()
+
+    def test_a_refused_setup_statement_is_the_one_named(self):
+        self.engine.reply(_answer("s1", True, _status()))
+        self.engine.reply({"success": False, "sessionId": "s1", "newSession": False,
+                           "errorMessage": "Warehouse 'W1' does not exist or not authorized.",
+                           "resultSets": []})
+        conn = self.connect()
+        with self.assertRaises(errors.ProgrammingError) as caught:
+            conn.cursor().execute("SELECT 1")
+        self.assertEqual("USE WAREHOUSE W1", caught.exception.query)
+        self.assert_all_answered()
+
+    def test_a_refused_setup_statement_keeps_failing_instead_of_falling_through(self):
+        missing = {"success": False, "sessionId": "s1", "newSession": False,
+                   "errorMessage": "SQL compilation error:\n"
+                                   "Warehouse 'W1' does not exist or not authorized.",
+                   "resultSets": []}
+        self.engine.reply(_answer("s1", True, _status()))
+        self.engine.reply(missing)
+        self.engine.reply(missing)
+        conn = self.connect()
+        cur = conn.cursor()
+        with self.assertRaises(errors.ProgrammingError) as first:
+            cur.execute("SELECT 1")
+        with self.assertRaises(errors.ProgrammingError) as second:
+            cur.execute("SELECT CURRENT_WAREHOUSE()")
+        # Neither statement reached the engine, nor did the setup past the refused USE:
+        # each met the refused statement first. USE ROLE took, and is not sent again.
+        self.assertEqual(["USE ROLE R1", "USE WAREHOUSE W1", "USE WAREHOUSE W1"],
+                         self.engine.statements())
+        for caught in (first, second):
+            self.assertEqual("USE WAREHOUSE W1", caught.exception.query)
+        # Once the engine takes it (the warehouse was created meanwhile), the rest of the
+        # setup follows, and then the statement.
+        for _ in _SETUP[1:]:
+            self.engine.reply(_answer("s1", False, _status()))
+        self.engine.reply(_answer("s1", False, _number("N", 1)))
+        cur.execute("SELECT 1 AS N")
+        self.assertEqual([(1,)], cur.fetchall())
+        self.assertEqual(["USE ROLE R1"] + ["USE WAREHOUSE W1"] * 3 + _SETUP[2:]
+                         + ["SELECT 1 AS N"], self.engine.statements())
+        self.assert_all_answered()
+
+    def test_closing_releases_the_session_once(self):
+        conn, cur = self.opened()
+        self.engine.reply(_RELEASED)
+        conn.close()
+        self.assertEqual(("DELETE", "/api/sessions/s1"), self.engine.requests[-1][:2])
+        self.assertTrue(conn.is_closed())
+        count = len(self.engine.requests)
+        conn.close()
+        self.assertEqual(count, len(self.engine.requests))
+        self.assertRaises(errors.InterfaceError, cur.execute, "SELECT 1")
+        self.assert_all_answered()
+
+    def test_leaving_a_with_block_releases_the_session(self):
+        self.set_up("s1")
+        self.engine.reply(_answer("s1", False, _number("N", 1)))
+        self.engine.reply(_RELEASED)
+        with self.connect() as conn:
+            conn.cursor().execute("SELECT 1 AS N")
+        self.assertEqual("DELETE", self.engine.requests[-1][0])
+        self.assert_all_answered()
+
+    def test_closing_never_raises(self):
+        for script in (lambda: self.engine.reply(_gone("s1"), status=404),
+                       lambda: self.engine.reply({"error": "Method not allowed"}, status=405),
+                       self.engine.drop):
+            conn, cur = self.opened()
+            script()
+            conn.close()
+            self.assertEqual("DELETE", self.engine.requests[-1][0])
+            self.assert_all_answered()
+        conn, cur = self.opened()
+        self.engine.stop()
+        conn.close()
+
+
+class OwedBeginTest(unittest.TestCase):
+    """With autocommit off, the BEGIN a statement is owed stays owed until it took."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def connect(self, **extra):
+        return sc.connect(host="127.0.0.1", port=self.engine.port, network_timeout=5,
+                          role="R1", warehouse="W1", database="APP", schema="PUBLIC",
+                          session_parameters={"QUERY_TAG": "tagged"}, **extra)
+
+    def assert_all_answered(self):
+        self.assertEqual([], self.engine.unscripted)
+        self.assertEqual(0, self.engine.pending)
+
+    def test_a_refused_setup_statement_leaves_the_begin_owed(self):
+        self.engine.reply(_answer("s1", True, _status()))
+        self.engine.reply({"success": False, "sessionId": "s1", "newSession": False,
+                           "errorMessage": "SQL compilation error:\n"
+                                           "Warehouse 'W1' does not exist or not authorized.",
+                           "resultSets": []})
+        conn = self.connect(autocommit=False)
+        cur = conn.cursor()
+        self.assertRaises(errors.ProgrammingError, cur.execute, "INSERT INTO t VALUES (1)")
+        for _ in _SETUP[1:] + ["BEGIN"]:
+            self.engine.reply(_answer("s1", False, _status()))
+        self.engine.reply(_answer("s1", False, _number("number of rows inserted", 1)))
+        self.engine.reply(_answer("s1", False, _status()))
+        cur.execute("INSERT INTO t VALUES (1)")
+        conn.rollback()
+        # Once the setup took, the INSERT ran inside the BEGIN it was owed, where the
+        # rollback() reached it.
+        self.assertEqual(_SETUP[:2] + _SETUP[1:]
+                         + ["BEGIN", "INSERT INTO t VALUES (1)", "ROLLBACK"],
+                         self.engine.statements())
+        insert = self.engine.executes()[-2]
+        self.assertIs(False, insert["autoCommit"])
+        self.assert_all_answered()
+
+    def test_a_failed_begin_stays_owed(self):
+        failures = (
+            (lambda: self.engine.reply({"success": False, "sessionId": "s1", "newSession": False,
+                                        "errorMessage": "SQL compilation error:\nnot now",
+                                        "resultSets": []}), errors.ProgrammingError),
+            (lambda: self.engine.reply_text("<html><body>502 Bad Gateway</body></html>", 502),
+             errors.OperationalError),
+            (self.engine.drop, errors.OperationalError),
+        )
+        for script, error in failures:
+            for _ in _SETUP:
+                self.engine.reply(_answer("s1", False, _status()))
+            conn = self.connect()
+            cur = conn.cursor()
+            conn.autocommit(False)
+            script()
+            self.assertRaises(error, cur.execute, "INSERT INTO t VALUES (1)")
+            self.engine.reply(_answer("s1", False, _status()))
+            self.engine.reply(_answer("s1", False, _number("number of rows inserted", 1)))
+            self.engine.reply(_answer("s1", False, _status()))
+            cur.execute("INSERT INTO t VALUES (1)")
+            conn.commit()
+            self.assertEqual(_SETUP + ["BEGIN", "BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"],
+                             self.engine.statements(), error.__name__)
+            self.assert_all_answered()
+            del self.engine.requests[:]
+
+
+class AutocommitBackOnTest(unittest.TestCase):
+    """autocommit(True) leaves the connection committing each statement on its own,
+    whatever the COMMIT it sends meets."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def connect(self):
+        return sc.connect(host="127.0.0.1", port=self.engine.port, network_timeout=5,
+                          role="R1", warehouse="W1", database="APP", schema="PUBLIC",
+                          session_parameters={"QUERY_TAG": "tagged"})
+
+    def test_a_failed_commit_turning_autocommit_on_leaves_the_next_statement_committing(self):
+        ok = _answer("s1", False, _status())
+        failures = (
+            # A refused COMMIT is followed by a ROLLBACK of the transaction nobody chose.
+            (lambda: (self.engine.reply({"success": False, "sessionId": "s1",
+                                         "newSession": False,
+                                         "errorMessage": "SQL compilation error:\nnot now",
+                                         "resultSets": []}), self.engine.reply(ok)),
+             errors.ProgrammingError, False, ["ROLLBACK"]),
+            # A COMMIT whose answer never came leaves the transaction open, and turning
+            # autocommit on commits what is open: the COMMIT goes out once more.
+            (lambda: (self.engine.drop(), self.engine.reply(ok)),
+             errors.OperationalError, False, ["COMMIT"]),
+            (lambda: self.engine.reply(_gone("s1"), status=404), errors.SessionLostError,
+             True, []),
+        )
+        for fail, error, lost, after in failures:
+            for _ in _SETUP + ["BEGIN"]:
+                self.engine.reply(_answer("s1", False, _status()))
+            self.engine.reply(_answer("s1", False, _number("number of rows inserted", 1)))
+            conn = self.connect()
+            cur = conn.cursor()
+            conn.autocommit(False)
+            cur.execute("INSERT INTO t VALUES (1)")
+            fail()
+            self.assertRaises(error, conn.autocommit, True)
+            # The next statement commits on its own: no BEGIN ahead of it, autocommit on.
+            # After a lost session it runs on a fresh one, behind the setup.
+            again = _SETUP if lost else []
+            for _ in again:
+                self.engine.reply(_answer("s2", False, _status()))
+            self.engine.reply(_answer("s2" if lost else "s1", False,
+                                      _number("number of rows inserted", 1)))
+            try:
+                cur.execute("INSERT INTO t VALUES (2)")
+            except errors.Error:
+                pass  # what went out, checked next, says why
+            self.assertEqual(_SETUP + ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"] + after
+                             + again + ["INSERT INTO t VALUES (2)"],
+                             self.engine.statements(), error.__name__)
+            self.assertIs(True, self.engine.executes()[-1]["autoCommit"], error.__name__)
+            self.assertEqual([], self.engine.unscripted)
+            self.assertEqual(0, self.engine.pending)
+            del self.engine.requests[:]
+
+
+class FailedCommitTest(unittest.TestCase):
+    """With autocommit off, a commit() or rollback() that failed still leaves the next
+    statement inside a transaction the next commit() reaches."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def in_transaction(self):
+        for _ in _SETUP + ["BEGIN"]:
+            self.engine.reply(_answer("s1", False, _status()))
+        self.engine.reply(_answer("s1", False, _number("number of rows inserted", 1)))
+        conn = sc.connect(host="127.0.0.1", port=self.engine.port, network_timeout=5,
+                          role="R1", warehouse="W1", database="APP", schema="PUBLIC",
+                          session_parameters={"QUERY_TAG": "tagged"})
+        cur = conn.cursor()
+        conn.autocommit(False)
+        cur.execute("INSERT INTO t VALUES (1)")
+        return conn, cur
+
+    def refused(self, message):
+        return {"success": False, "sessionId": "s1", "newSession": False,
+                "errorMessage": "SQL compilation error:\n" + message, "resultSets": []}
+
+    def test_the_statement_after_a_failed_commit_or_rollback_is_committed_by_the_next_commit(self):
+        ok = _answer("s1", False, _status())
+        cases = (
+            # what ends the transaction, how it fails, what the driver sends after it,
+            # whether the next INSERT opens a fresh transaction, and on which session
+            ("commit", lambda: (self.engine.reply(self.refused("not now")), self.engine.reply(ok)),
+             errors.ProgrammingError, ["ROLLBACK"], True, "s1"),
+            ("commit", self.engine.drop, errors.OperationalError, [], False, "s1"),
+            ("commit", lambda: self.engine.reply(_gone("s1"), status=404),
+             errors.SessionLostError, [], True, "s2"),
+            ("rollback", lambda: self.engine.reply(self.refused("no")), errors.ProgrammingError,
+             [], True, "s1"),
+        )
+        for ending, fail, error, after, opens_one, session_id in cases:
+            conn, cur = self.in_transaction()
+            fail()
+            self.assertRaises(error, getattr(conn, ending))
+            again = _SETUP if session_id != "s1" else []
+            for _ in again + (["BEGIN"] if opens_one else []):
+                self.engine.reply(_answer(session_id, False, _status()))
+            self.engine.reply(_answer(session_id, False, _number("number of rows inserted", 1)))
+            self.engine.reply(_answer(session_id, False, _status()))
+            try:
+                cur.execute("INSERT INTO t VALUES (2)")
+                conn.commit()
+            except errors.Error:
+                pass  # what went out, checked next, says why
+            self.assertEqual(_SETUP + ["BEGIN", "INSERT INTO t VALUES (1)", ending.upper()] + after
+                             + again + (["BEGIN"] if opens_one else [])
+                             + ["INSERT INTO t VALUES (2)", "COMMIT"],
+                             self.engine.statements(), "%s %s" % (ending, error.__name__))
+            self.assertEqual([], self.engine.unscripted)
+            self.assertEqual(0, self.engine.pending)
+            del self.engine.requests[:]
+
+
+class SessionLifetimeLiveTest(unittest.TestCase):
+    """The same against the engine: a session released out of band, and close()."""
+
+    def setUp(self):
+        if PORT is None:
+            self.skipTest("FROSTLAKE_CLASSPATH not set")
+        # Asked over the wire rather than of the client: an engine that answers newSession
+        # also takes requireSession and releases sessions on DELETE.
+        probe = self.post({"sql": "SELECT 1"})
+        if "newSession" not in probe:
+            self.skipTest("this engine predates requireSession and session release")
+        self.release_out_of_band(probe["sessionId"])
+
+    def base(self):
+        return "http://127.0.0.1:%d" % PORT
+
+    def post(self, payload):
+        request = urllib.request.Request(self.base() + "/api/execute",
+                                         data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def active_sessions(self):
+        with urllib.request.urlopen(self.base() + "/api/sessions", timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))["activeSessions"]
+
+    def release_out_of_band(self, session_id):
+        request = urllib.request.Request(self.base() + "/api/sessions/" + session_id,
+                                         method="DELETE")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(200, response.status)
+
+    def set_up(self, database):
+        admin = sc.connect(host="127.0.0.1", port=PORT)
+        cur = admin.cursor()
+        cur.execute("CREATE OR REPLACE DATABASE %s" % database)
+        cur.execute("CREATE SCHEMA IF NOT EXISTS %s.s2" % database)
+        cur.execute("CREATE WAREHOUSE IF NOT EXISTS fac_lost_wh")
+        cur.execute("CREATE OR REPLACE TABLE %s.s2.t (a INTEGER)" % database)
+        admin.close()
+        return sc.connect(host="127.0.0.1", port=PORT, database=database, schema="s2",
+                          warehouse="fac_lost_wh", timezone="Asia/Tokyo")
+
+    def test_a_session_released_out_of_band_comes_back_on_the_connect_setup(self):
+        conn = self.set_up("fac_lost_db")
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        lost = conn.session_id
+        self.release_out_of_band(lost)
+        cur.execute("SELECT CURRENT_DATABASE() AS d, CURRENT_SCHEMA() AS s, "
+                    "CURRENT_WAREHOUSE() AS w")
+        self.assertEqual([("FAC_LOST_DB", "S2", "FAC_LOST_WH")], cur.fetchall())
+        cur.execute("SHOW PARAMETERS LIKE 'TIMEZONE' IN SESSION")
+        self.assertEqual("Asia/Tokyo", cur.fetchone()[1])
+        self.assertNotEqual(lost, conn.session_id)
+        conn.close()
+
+    def test_a_session_released_with_a_transaction_open_is_reported(self):
+        conn = self.set_up("fac_losttx_db")
+        conn.autocommit(False)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO t VALUES (1)")
+        self.release_out_of_band(conn.session_id)
+        with self.assertRaises(errors.OperationalError) as caught:
+            cur.execute("INSERT INTO t VALUES (2)")
+        self.assertIsInstance(caught.exception, errors.SessionLostError)
+        # The release rolled the first row back, and the second never ran.
+        conn.autocommit(True)
+        cur.execute("SELECT COUNT(*) FROM t")
+        self.assertEqual([(0,)], cur.fetchall())
+        conn.close()
+
+    def test_closing_releases_the_session(self):
+        conn = sc.connect(host="127.0.0.1", port=PORT)
+        conn.cursor().execute("SELECT 1")
+        before = self.active_sessions()
+        conn.close()
+        self.assertEqual(before - 1, self.active_sessions())
+
+
+class RefusedSetupLiveTest(unittest.TestCase):
+    """A USE from connect() that the engine refuses, against the engine."""
+
+    def setUp(self):
+        if PORT is None:
+            self.skipTest("FROSTLAKE_CLASSPATH not set")
+
+    def test_a_refused_warehouse_keeps_failing_instead_of_falling_through(self):
+        admin = sc.connect(host="127.0.0.1", port=PORT)
+        admin_cur = admin.cursor()
+        admin_cur.execute("CREATE OR REPLACE DATABASE fac_refused_db")
+        admin_cur.execute("DROP WAREHOUSE IF EXISTS fac_late_wh")
+        conn = sc.connect(host="127.0.0.1", port=PORT, warehouse="fac_late_wh",
+                          database="fac_refused_db")
+        cur = conn.cursor()
+        # The USE WAREHOUSE is refused, and stays in line: nothing runs without it, and the
+        # USE DATABASE after it is not skipped over either.
+        for sql in ("SELECT 1", "SELECT CURRENT_WAREHOUSE()"):
+            with self.assertRaises(errors.ProgrammingError) as caught:
+                cur.execute(sql)
+            self.assertEqual("USE WAREHOUSE fac_late_wh", caught.exception.query)
+        # Once the warehouse exists, the next statement applies the rest of the setup.
+        admin_cur.execute("CREATE WAREHOUSE fac_late_wh")
+        admin.close()
+        cur.execute("SELECT CURRENT_WAREHOUSE() AS w, CURRENT_DATABASE() AS d")
+        self.assertEqual([("FAC_LATE_WH", "FAC_REFUSED_DB")], cur.fetchall())
+        conn.close()
+
+    def test_with_autocommit_off_a_refused_setup_leaves_the_transaction_owed(self):
+        admin = sc.connect(host="127.0.0.1", port=PORT)
+        admin_cur = admin.cursor()
+        admin_cur.execute("CREATE OR REPLACE DATABASE fac_owed_db")
+        conn = sc.connect(host="127.0.0.1", port=PORT, database="fac_owed_db",
+                          schema="s_late", autocommit=False)
+        cur = conn.cursor()
+        # USE SCHEMA is refused while the schema does not exist yet.
+        self.assertRaises(errors.ProgrammingError, cur.execute, "SELECT 1")
+        admin_cur.execute("CREATE SCHEMA fac_owed_db.s_late")
+        admin_cur.execute("CREATE TABLE fac_owed_db.s_late.t (a INTEGER)")
+        cur.execute("INSERT INTO t VALUES (1)")
+        # The INSERT ran inside the transaction autocommit off owed it, so a second session
+        # does not see the row until commit(), and then does.
+        admin_cur.execute("SELECT COUNT(*) FROM fac_owed_db.s_late.t")
+        self.assertEqual([(0,)], admin_cur.fetchall())
+        conn.commit()
+        admin_cur.execute("SELECT COUNT(*) FROM fac_owed_db.s_late.t")
+        self.assertEqual([(1,)], admin_cur.fetchall())
+        conn.close()
+        admin.close()
+
+
+@unittest.skipUnless(os.environ.get("FL_CORPUS"),
+                     "set FL_CORPUS to frostlake's engine/src/test/resources/testkit"
+                     " to replay the testkit corpus")
+class TestkitCorpusTest(unittest.TestCase):
+    """The engine's testkit corpus, replayed through the facade by testkit_runner.py."""
+
+    def test_corpus_replays_without_failures(self):
+        # Loaded by path: the driver checkout ahead of ROOT on sys.path has a runner of the
+        # same name.
+        spec = importlib.util.spec_from_file_location("testkit_runner",
+                                                      ROOT / "testkit_runner.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        runner.suites_directory()   # an FL_CORPUS without suites fails here, before any engine
+        if not (os.environ.get("FROSTLAKE_CLASSPATH") or os.environ.get("FROSTLAKE_URL")):
+            self.skipTest("no engine (set FROSTLAKE_CLASSPATH or FROSTLAKE_URL)")
+        # The runner prints its tally and first failures, and returns 1 on a failed or
+        # errored case.
+        self.assertEqual(0, runner.main(["--backend", "connector"]))
 
 
 if __name__ == "__main__":

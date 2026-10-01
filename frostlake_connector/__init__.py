@@ -16,7 +16,9 @@ multi-statement scripts, autocommit()/commit()/rollback(), a full errors module,
 role/warehouse/database/schema/session_parameters applied on connect.
 
 Transport is the ``frostlake`` PEP 249 driver (frostlake-python), which must be
-importable alongside this package.
+importable alongside this package. The engine session is the driver's: close() releases
+it, and the setup from connect() goes back on a session that replaces one the engine lost,
+unless the lost one held a transaction or context of the caller's (SessionLostError).
 """
 
 import uuid as _uuid
@@ -36,6 +38,7 @@ from .errors import (  # noqa: F401  (re-exported for `except frostlake_connecto
     NotSupportedError,
     OperationalError,
     ProgrammingError,
+    SessionLostError,
 )
 
 __version__ = "0.2.1"
@@ -83,22 +86,27 @@ class FrostlakeConnection(object):
         self.database = kwargs.get("database")
         self.schema = kwargs.get("schema")
 
-        self._pending = []
+        scope = []
         if self.role:
-            self._pending.append("USE ROLE " + _quote_ident(self.role))
+            scope.append("USE ROLE " + _quote_ident(self.role))
         if self.warehouse:
-            self._pending.append("USE WAREHOUSE " + _quote_ident(self.warehouse))
+            scope.append("USE WAREHOUSE " + _quote_ident(self.warehouse))
         if self.database:
-            self._pending.append("USE DATABASE " + _quote_ident(self.database))
+            scope.append("USE DATABASE " + _quote_ident(self.database))
         if self.schema:
-            self._pending.append("USE SCHEMA " + _quote_ident(self.schema))
+            scope.append("USE SCHEMA " + _quote_ident(self.schema))
         session_parameters = dict(kwargs.get("session_parameters") or {})
         if kwargs.get("timezone"):
             session_parameters.setdefault("TIMEZONE", kwargs["timezone"])
         for key, value in session_parameters.items():
-            self._pending.append(
+            scope.append(
                 "ALTER SESSION SET %s = %s" % (_quote_ident(str(key)), _session_value(value))
             )
+        # The session is the driver's, so the connection's scope is handed to it: it goes
+        # on before the first statement, and back on the fresh session that replaces one
+        # the engine has lost. Run as ordinary statements instead, these would count as
+        # context set up by the caller, and a lost session would be refused, not replaced.
+        self._inner._use_scope(scope)
 
     # -- public surface ------------------------------------------------------
 
@@ -137,9 +145,14 @@ class FrostlakeConnection(object):
             return
         self._autocommit = wanted
         if wanted:
-            _guard(self._inner.commit)
-            self._inner.autocommit = True
-            self._begin_pending = False
+            try:
+                _guard(self._inner.commit)
+            finally:
+                # Autocommit is on from here, down in the driver too, whatever the COMMIT
+                # met: left off there, the next statement would run in a transaction that
+                # nobody commits.
+                self._inner.autocommit = True
+                self._begin_pending = False
         else:
             self._begin_pending = True
 
@@ -169,12 +182,13 @@ class FrostlakeConnection(object):
     # -- internal ------------------------------------------------------------
 
     def _run(self, sql, query_id=None, num_statements=None):
-        while self._pending:
-            pending = self._pending.pop(0)
-            _guard(self._inner._execute, pending, query=pending)
+        # The driver puts the scope on first (see __init__), so a BEGIN below never
+        # precedes it. The BEGIN is spent only once it took: a refused scope statement or
+        # a failed BEGIN leaves it owed, so the statement tried next still runs inside the
+        # transaction autocommit off promises, where a rollback() can reach it.
         if self._begin_pending:
-            self._begin_pending = False
             _guard(self._inner.begin)
+            self._begin_pending = False
         return _guard(self._inner._execute, sql, num_statements, query=sql, query_id=query_id)
 
 
@@ -331,10 +345,15 @@ def _guard(fn, *args, **context):
         return fn(*args)
     except _frostlake.ProgrammingError as e:
         message = str(e)
+        # A statement of the connection's own scope (USE ROLE, USE DATABASE, ALTER
+        # SESSION, ...) names itself when refused: the caller's statement never ran.
+        query = getattr(e, "statement", None) or query
         if message.startswith("SQL compilation error"):
             raise errors.ProgrammingError(msg=message, errno=1003, sqlstate="42000",
                                           query=query, query_id=query_id) from e
         raise errors.ProgrammingError(msg=message, query=query, query_id=query_id) from e
+    except _frostlake.SessionLostError as e:
+        raise errors.SessionLostError(msg=str(e), query=query, query_id=query_id) from e
     except _frostlake.OperationalError as e:
         raise errors.OperationalError(msg=str(e), query=query, query_id=query_id) from e
     except _frostlake.InterfaceError as e:

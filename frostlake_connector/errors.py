@@ -39,6 +39,16 @@ class OperationalError(DatabaseError):
     """The server could not be reached, or dropped the request."""
 
 
+class SessionLostError(OperationalError):
+    """The engine no longer holds the connection's session, and the statement did not run.
+
+    Raised in place of re-running the statement when the lost session held an open
+    transaction or context a fresh session would lack (USE, SET, ALTER SESSION, a temporary
+    object). The connection stays usable: its next statement starts a fresh session on the
+    connection's scope.
+    """
+
+
 class IntegrityError(DatabaseError):
     """A constraint was violated."""
 

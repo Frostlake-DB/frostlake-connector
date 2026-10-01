@@ -8,3 +8,6 @@ __pycache__/
 frostlake_connector.egg-info/
 build/
 dist/
+
+# testkit_runner.py reports
+target/
