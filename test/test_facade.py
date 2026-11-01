@@ -5,6 +5,7 @@ integration tests skip themselves when the variable is unset.
 """
 
 import atexit
+import decimal
 import http.server
 import importlib.util
 import json
@@ -213,6 +214,23 @@ class PyformatBindingTest(unittest.TestCase):
         self.assertEqual("SELECT 1 -- %s\n", sc._bind_pyformat("SELECT %s -- %s\n", (1,)))
         self.assertEqual("SELECT 1 // %s\n", sc._bind_pyformat("SELECT %s // %s\n", (1,)))
 
+    def test_a_line_comment_ends_at_a_carriage_return(self):
+        # As in the lexer, a line comment ends at a CR or an LF, whichever comes first.
+        self.assertEqual("SELECT 1 -- c\r, 7", sc._bind_pyformat("SELECT 1 -- c\r, %s", (7,)))
+        self.assertEqual("SELECT 1 // c\r, 7", sc._bind_pyformat("SELECT 1 // c\r, %s", (7,)))
+
+    def test_a_negative_number_binds_in_parentheses(self):
+        # Bare, 3-%s became 3--5, a line comment, and %s::VARCHAR cast before it negated.
+        self.assertEqual("SELECT 3-(-5)", sc._bind_pyformat("SELECT 3-%s", (-5,)))
+        self.assertEqual("SELECT (-5)::VARCHAR", sc._bind_pyformat("SELECT %s::VARCHAR", (-5,)))
+        self.assertEqual("SELECT 3-(-2.5), (-2.5)", sc._bind_pyformat(
+            "SELECT 3-%s, %s", (-2.5, decimal.Decimal("-2.5"))))
+        self.assertEqual("SELECT 3-(-123456789012345678901234567890)", sc._bind_pyformat(
+            "SELECT 3-%s", (-123456789012345678901234567890,)))
+        # The rendered text decides: -0.0 is not below zero, yet bare it would read 3--0.0.
+        self.assertEqual("SELECT 3-(-0.0)", sc._bind_pyformat("SELECT 3-%s", (-0.0,)))
+        self.assertEqual("SELECT 3-(-5)", sc._bind_pyformat("SELECT 3-%(n)s", {"n": -5}))
+
     def test_placeholders_are_skipped_inside_block_comments(self):
         self.assertEqual("SELECT 1 /* %s */", sc._bind_pyformat("SELECT %s /* %s */", (1,)))
 
@@ -253,6 +271,13 @@ class DollarQuotedTest(unittest.TestCase):
     def test_named_placeholder_inside_a_body_is_not_bound(self):
         self.assertEqual("SELECT $$%(a)s$$, 'x'",
                          sc._bind_pyformat("SELECT $$%(a)s$$, %(a)s", {"a": "x"}))
+
+    def test_dollars_inside_a_name_open_no_body(self):
+        # The lexer reads a name whole, [a-zA-Z_][a-zA-Z0-9_$]*, so a$$b is one name.
+        self.assertEqual("SELECT 1 AS a$$b, 7",
+                         sc._bind_pyformat("SELECT 1 AS a$$b, %s", (7,)))
+        self.assertEqual("SELECT 1 AS a$$b, 7",
+                         sc._bind_pyformat("SELECT 1 AS a$$b, %(n)s", {"n": 7}))
 
     def test_a_procedure_body_is_not_split_on_its_semicolons(self):
         script = ("CREATE OR REPLACE PROCEDURE q() RETURNS INTEGER LANGUAGE SQL "
@@ -344,6 +369,13 @@ class SplitStatementsTest(unittest.TestCase):
     def test_unterminated_block_comment_runs_to_the_end(self):
         self.assertEqual(["SELECT 1 /* ;"], sc._split_statements("SELECT 1 /* ;"))
 
+    def test_names_and_line_ends_are_read_as_the_lexer_reads_them(self):
+        # The $$ inside the name a$$b opens no body, and a line comment ends at a CR.
+        self.assertEqual(["SELECT 1 AS a$$b", "SELECT 2"],
+                         sc._split_statements("SELECT 1 AS a$$b; SELECT 2"))
+        self.assertEqual(["SELECT 1 -- c", "SELECT 2"],
+                         sc._split_statements("SELECT 1 -- c\r; SELECT 2"))
+
     def test_trailing_statement_without_a_semicolon(self):
         self.assertEqual(["SELECT 1", "SELECT 2"], sc._split_statements("SELECT 1; SELECT 2"))
 
@@ -377,6 +409,8 @@ class FacadeTest(unittest.TestCase):
     def test_role_and_timezone_kwargs(self):
         conn, cur = self.bootstrap("fac_role_db")
         cur.execute("CREATE ROLE IF NOT EXISTS fac_role")
+        # A role activates only for a user it reaches; the default user holds ACCOUNTADMIN.
+        cur.execute("GRANT ROLE fac_role TO ROLE ACCOUNTADMIN")
         conn.close()
         conn2 = sc.connect(host="127.0.0.1", port=PORT, database="fac_role_db",
                            role="fac_role", timezone="UTC")
@@ -878,6 +912,64 @@ class MultiStatementCountWireTest(unittest.TestCase):
     def test_zero_is_an_answer_and_is_sent(self):
         self.conn.cursor().execute("SELECT 1; SELECT 2;", num_statements=0)
         self.assertEqual(0, self.BODIES[-1]["multiStatementCount"])
+
+
+class BindingWireTest(unittest.TestCase):
+    """The statement a bound value puts on the wire, in either paramstyle — no server of
+    the engine's needed. The qmark style binds through the driver's own substitution."""
+
+    BODIES = []
+    CELLS = (("SELECT 3-{}", -5, "SELECT 3-(-5)"),
+             ("SELECT {}::VARCHAR", -5, "SELECT (-5)::VARCHAR"),
+             ("SELECT 1 AS a$$b, {}", 7, "SELECT 1 AS a$$b, 7"),
+             ("SELECT 1 -- c\r, {}", 7, "SELECT 1 -- c\r, 7"),
+             ("SELECT 3-{}", -2.5, "SELECT 3-(-2.5)"),
+             ("SELECT 3-{}", decimal.Decimal("-2.5"), "SELECT 3-(-2.5)"),
+             ("SELECT 3-{}", -(10 ** 30), "SELECT 3-(-%d)" % (10 ** 30)),
+             ("SELECT 3-{}", -0.0, "SELECT 3-(-0.0)"))
+
+    @classmethod
+    def setUpClass(cls):
+        bodies = cls.BODIES
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                bodies.append(json.loads(self.rfile.read(length).decode("utf-8")))
+                body = b'{"success": true, "sessionId": "s1", "resultSets": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def sent(self, paramstyle, placeholder):
+        conn = sc.connect(host="127.0.0.1", port=self.server.server_address[1],
+                          paramstyle=paramstyle)
+        self.addCleanup(conn.close)
+        out = []
+        for template, value, _ in self.CELLS:
+            conn.cursor().execute(template.format(placeholder), (value,))
+            out.append(self.BODIES[-1]["sql"])
+        return out
+
+    def test_pyformat_sends_each_cell_as_the_engine_reads_it(self):
+        self.assertEqual([want for _, _, want in self.CELLS], self.sent("pyformat", "%s"))
+
+    def test_qmark_sends_each_cell_as_the_engine_reads_it(self):
+        self.assertEqual([want for _, _, want in self.CELLS], self.sent("qmark", "?"))
 
 
 # -- session lifetime ---------------------------------------------------------------

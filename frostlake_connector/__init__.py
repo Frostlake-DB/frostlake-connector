@@ -41,7 +41,7 @@ from .errors import (  # noqa: F401  (re-exported for `except frostlake_connecto
     SessionLostError,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 apilevel = "2.0"
 threadsafety = 2
 paramstyle = "pyformat"
@@ -374,6 +374,21 @@ def _session_value(value):
     return _frostlake._encode_string(str(value))
 
 
+# A name as the lexer reads one, [a-zA-Z_][a-zA-Z0-9_$]*: read whole, so the $$ inside
+# a$$b opens no dollar-quoted body.
+_NAME_START = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+_NAME_PART = _NAME_START | frozenset("0123456789$")
+
+
+def _skip_name(sql, i):
+    """Index just past the name starting at `i`."""
+    j = i + 1
+    n = len(sql)
+    while j < n and sql[j] in _NAME_PART:
+        j += 1
+    return j
+
+
 def _bind_pyformat(sql, params):
     """Inline %s / %(name)s placeholders (%% escapes a percent), skipping string
     literals, quoted identifiers and comments — same scanner as the driver."""
@@ -404,6 +419,10 @@ def _bind_pyformat(sql, params):
             i = j
         elif ch == "/" and sql.startswith("//", i):
             j = _frostlake._skip_line(sql, i)
+            out.append(sql[i:j])
+            i = j
+        elif ch in _NAME_START:
+            j = _skip_name(sql, i)
             out.append(sql[i:j])
             i = j
         elif ch == "$" and sql.startswith("$$", i):
@@ -466,6 +485,8 @@ def _split_statements(sql_text):
             i = n if end < 0 else end + 2
         elif ch == "/" and sql_text.startswith("//", i):
             i = _frostlake._skip_line(sql_text, i)
+        elif ch in _NAME_START:
+            i = _skip_name(sql_text, i)
         elif ch == "$" and sql_text.startswith("$$", i):
             # Procedure and UDF bodies are full of semicolons; splitting on them would
             # tear a CREATE PROCEDURE into fragments.
